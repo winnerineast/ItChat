@@ -5,6 +5,7 @@ import copy, pickle, random
 import traceback, logging
 
 import requests
+from pyqrcode import QRCode
 
 from .. import config, utils
 from ..returnvalues import ReturnValue
@@ -26,22 +27,22 @@ def load_login(core):
 
 def login(self, enableCmdQR=False, picDir=None, qrCallback=None,
         loginCallback=None, exitCallback=None):
-    if self.alive:
+    if self.alive or self.isLogging:
         logger.warning('itchat has already logged in.')
         return
-    while 1:
-        for getCount in range(10):
+    self.isLogging = True
+    while self.isLogging:
+        uuid = push_login(self)
+        if uuid:
+            qrStorage = io.BytesIO()
+        else:
             logger.info('Getting uuid of QR code.')
-            while not self.get_QRuuid(): time.sleep(1)
+            while not self.get_QRuuid():
+                time.sleep(1)
             logger.info('Downloading QR code.')
             qrStorage = self.get_QR(enableCmdQR=enableCmdQR,
                 picDir=picDir, qrCallback=qrCallback)
-            if qrStorage:
-                break
-            elif 9 == getCount:
-                logger.info('Failed to get QR code, please restart the program.')
-                sys.exit()
-        logger.info('Please scan the QR code to log in.')
+            logger.info('Please scan the QR code to log in.')
         isLoggedIn = False
         while not isLoggedIn:
             status = self.check_login()
@@ -55,8 +56,12 @@ def login(self, enableCmdQR=False, picDir=None, qrCallback=None,
                     isLoggedIn = None
             elif status != '408':
                 break
-        if isLoggedIn: break
-        logger.info('Log in time out, reloading QR code')
+        if isLoggedIn:
+            break
+        logger.info('Log in time out, reloading QR code.')
+    else:
+        return # log in process is stopped by user
+    logger.info('Loading the contact, this may take a little while.')
     self.web_init()
     self.show_mobile_login()
     self.get_contact(True)
@@ -68,6 +73,19 @@ def login(self, enableCmdQR=False, picDir=None, qrCallback=None,
             os.remove(picDir or config.DEFAULT_QR)
         logger.info('Login successfully as %s' % self.storageClass.nickName)
     self.start_receiving(exitCallback)
+    self.isLogging = False
+
+def push_login(core):
+    cookiesDict = core.s.cookies.get_dict()
+    if 'wxuin' in cookiesDict:
+        url = '%s/cgi-bin/mmwebwx-bin/webwxpushloginurl?uin=%s' % (
+            config.BASE_URL, cookiesDict['wxuin'])
+        headers = { 'User-Agent' : config.USER_AGENT }
+        r = core.s.get(url, headers=headers).json()
+        if 'uuid' in r and r.get('ret') in (0, '0'):
+            core.uuid = r['uuid']
+            return r['uuid']
+    return False
 
 def get_QRuuid(self):
     url = '%s/jslogin' % config.BASE_URL
@@ -85,20 +103,17 @@ def get_QRuuid(self):
 def get_QR(self, uuid=None, enableCmdQR=False, picDir=None, qrCallback=None):
     uuid = uuid or self.uuid
     picDir = picDir or config.DEFAULT_QR
-    url = '%s/qrcode/%s' % (config.BASE_URL, uuid)
-    headers = { 'User-Agent' : config.USER_AGENT }
-    try:
-        r = self.s.get(url, stream=True, headers=headers)
-    except:
-        return False
-    qrStorage = io.BytesIO(r.content)
+    qrStorage = io.BytesIO()
+    qrCode = QRCode('https://login.weixin.qq.com/l/' + uuid)
+    qrCode.png(qrStorage, scale=10)
     if hasattr(qrCallback, '__call__'):
         qrCallback(uuid=uuid, status='0', qrcode=qrStorage.getvalue())
     else:
-        with open(picDir, 'wb') as f: f.write(r.content)
         if enableCmdQR:
-            utils.print_cmd_qr(picDir, enableCmdQR=enableCmdQR)
+            utils.print_cmd_qr(qrCode.text(1), enableCmdQR=enableCmdQR)
         else:
+            with open(picDir, 'wb') as f:
+                f.write(qrStorage.getvalue())
             utils.print_qr(picDir)
     return qrStorage
 
@@ -168,11 +183,28 @@ def web_init(self):
     utils.emoji_formatter(dic['User'], 'NickName')
     self.loginInfo['InviteStartCount'] = int(dic['InviteStartCount'])
     self.loginInfo['User'] = utils.struct_friend_info(dic['User'])
+    self.memberList.append(self.loginInfo['User'])
     self.loginInfo['SyncKey'] = dic['SyncKey']
     self.loginInfo['synckey'] = '|'.join(['%s_%s' % (item['Key'], item['Val'])
         for item in dic['SyncKey']['List']])
     self.storageClass.userName = dic['User']['UserName']
     self.storageClass.nickName = dic['User']['NickName']
+    # deal with contact list returned when init
+    contactList = dic.get('ContactList', [])		
+    chatroomList, otherList = [], []		
+    for m in contactList:		
+        if m['Sex'] != 0:		
+            otherList.append(m)		
+        elif '@@' in m['UserName']:		
+            m['MemberList'] = [] # don't let dirty info pollute the list
+            chatroomList.append(m)		
+        elif '@' in m['UserName']:		
+            # mp will be dealt in update_local_friends as well		
+            otherList.append(m)		
+    if chatroomList:
+        update_local_chatrooms(self, chatroomList)		
+    if otherList:
+        update_local_friends(self, otherList)
     return dic
 
 def show_mobile_login(self):
@@ -200,12 +232,13 @@ def start_receiving(self, exitCallback=None, getReceivingFnOnly=False):
                 if i is None:
                     self.alive = False
                 elif i == '0':
-                    continue
+                    pass
                 else:
                     msgList, contactList = self.get_msg()
                     if msgList:
                         msgList = produce_msg(self, msgList)
-                        for msg in msgList: self.msgList.put(msg)
+                        for msg in msgList:
+                            self.msgList.put(msg)
                     if contactList:
                         chatroomList, otherList = [], []
                         for contact in contactList:
@@ -284,6 +317,7 @@ def logout(self):
         headers = { 'User-Agent' : config.USER_AGENT }
         self.s.get(url, params=params, headers=headers)
         self.alive = False
+    self.isLogging = False
     self.s.cookies.clear()
     del self.chatroomList[:]
     del self.memberList[:]

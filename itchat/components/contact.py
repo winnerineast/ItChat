@@ -6,6 +6,7 @@ import requests
 
 from .. import config, utils
 from ..returnvalues import ReturnValue
+from ..storage import contact_change
 
 logger = logging.getLogger('itchat')
 
@@ -107,6 +108,7 @@ def update_info_dict(oldInfoDict, newInfoDict):
         elif oldInfoDict.get(k) is None or v not in (None, '', '0', 0):
             oldInfoDict[k] = v
 
+@contact_change
 def update_local_chatrooms(core, l):
     '''
         get a list of chatrooms for updating local chatrooms
@@ -167,6 +169,7 @@ def update_local_chatrooms(core, l):
         'FromUserName' : core.storageClass.userName,
         'ToUserName'   : core.storageClass.userName, }
 
+@contact_change
 def update_local_friends(core, l):
     '''
         get a list of friends or mps for updating local contact
@@ -188,6 +191,7 @@ def update_local_friends(core, l):
         else:
             update_info_dict(oldInfoDict, friend)
 
+@contact_change
 def update_local_uin(core, msg):
     '''
         content contains uins and StatusNotifyUserName contains username
@@ -222,7 +226,9 @@ def update_local_uin(core, msg):
                                 userDicts['Uin'], uin))
                 else:
                     if '@@' in username:
+                        core.storageClass.updateLock.release()
                         update_chatroom(core, username)
+                        core.storageClass.updateLock.acquire()
                         newChatroomDict = utils.search_dict_list(
                             core.chatroomList, 'UserName', username)
                         if newChatroomDict is None:
@@ -233,10 +239,18 @@ def update_local_uin(core, msg):
                         else:
                             newChatroomDict['Uin'] = uin
                     elif '@' in username:
+                        core.storageClass.updateLock.release()
                         update_friend(core, username)
+                        core.storageClass.updateLock.acquire()
                         newFriendDict = utils.search_dict_list(
                             core.memberList, 'UserName', username)
-                        newFriendDict['Uin'] = uin
+                        if newFriendDict is None:
+                            newFriendDict = utils.struct_friend_info({
+                                'UserName': username,
+                                'Uin': uin, })
+                            core.memberList.append(newFriendDict)
+                        else:
+                            newFriendDict['Uin'] = uin
                     usernameChangedList.append(username)
                     logger.debug('Uin fetched: %s, %s' % (username, uin))
         else:
@@ -248,16 +262,31 @@ def update_local_uin(core, msg):
     return r
 
 def get_contact(self, update=False):
-    if not update: return copy.deepcopy(self.chatroomList)
-    url = '%s/webwxgetcontact?r=%s&seq=0&skey=%s' % (self.loginInfo['url'],
-        int(time.time()), self.loginInfo['skey'])
-    headers = {
-        'ContentType': 'application/json; charset=UTF-8',
-        'User-Agent' : config.USER_AGENT, }
-    r = self.s.get(url, headers=headers)
-    tempList = json.loads(r.content.decode('utf-8', 'replace'))['MemberList']
+    if not update:
+        return utils.contact_deep_copy(self, self.chatroomList)
+    def _get_contact(seq=0):
+        url = '%s/webwxgetcontact?r=%s&seq=%s&skey=%s' % (self.loginInfo['url'],
+            int(time.time()), seq, self.loginInfo['skey'])
+        headers = {
+            'ContentType': 'application/json; charset=UTF-8',
+            'User-Agent' : config.USER_AGENT, }
+        try:
+            r = self.s.get(url, headers=headers)
+        except:
+            logger.info('Failed to fetch contact, that may because of the amount of your chatrooms')
+            for chatroom in self.get_chatrooms():
+                self.update_chatroom(chatroom['UserName'], detailedMember=True)
+            return 0, []
+        j = json.loads(r.content.decode('utf-8', 'replace'))
+        return j.get('Seq', 0), j.get('MemberList')
+    seq, memberList = 0, []
+    while 1:
+        seq, batchMemberList = _get_contact(seq)
+        memberList.extend(batchMemberList)
+        if seq == 0:
+            break
     chatroomList, otherList = [], []
-    for m in tempList:
+    for m in memberList:
         if m['Sex'] != 0:
             otherList.append(m)
         elif '@@' in m['UserName']:
@@ -265,24 +294,28 @@ def get_contact(self, update=False):
         elif '@' in m['UserName']:
             # mp will be dealt in update_local_friends as well
             otherList.append(m)
-    if chatroomList: update_local_chatrooms(self, chatroomList)
-    if otherList: update_local_friends(self, otherList)
-    return copy.deepcopy(chatroomList)
+    if chatroomList:
+        update_local_chatrooms(self, chatroomList)
+    if otherList:
+        update_local_friends(self, otherList)
+    return utils.contact_deep_copy(self, chatroomList)
 
 def get_friends(self, update=False):
-    if update: self.get_contact(update=True)
-    return copy.deepcopy(self.memberList)
+    if update:
+        self.get_contact(update=True)
+    return utils.contact_deep_copy(self, self.memberList)
 
 def get_chatrooms(self, update=False, contactOnly=False):
     if contactOnly:
         return self.get_contact(update=True)
     else:
-        if update: self.get_contact(True)
-        return copy.deepcopy(self.chatroomList)
+        if update:
+            self.get_contact(True)
+        return utils.contact_deep_copy(self, self.chatroomList)
 
 def get_mps(self, update=False):
     if update: self.get_contact(update=True)
-    return copy.deepcopy(self.mpList)
+    return utils.contact_deep_copy(self, self.mpList)
 
 def set_alias(self, userName, alias):
     oldFriendInfo = utils.search_dict_list(
@@ -301,7 +334,8 @@ def set_alias(self, userName, alias):
     r = self.s.post(url, json.dumps(data, ensure_ascii=False).encode('utf8'),
         headers=headers)
     r = ReturnValue(rawResponse=r)
-    if r: oldFriendInfo['RemarkName'] = alias
+    if r:
+        oldFriendInfo['RemarkName'] = alias
     return r
 
 def set_pinned(self, userName, isPinned=True):
@@ -332,14 +366,15 @@ def add_friend(self, userName, status=2, verifyContent='', autoUpdate=True):
             'VerifyUserTicket': '', }],
         'VerifyContent': verifyContent,
         'SceneListCount': 1,
-        'SceneList': 33, # [33]
+        'SceneList': [33],
         'skey': self.loginInfo['skey'], }
     headers = {
         'ContentType': 'application/json; charset=UTF-8',
         'User-Agent' : config.USER_AGENT }
     r = self.s.post(url, headers=headers,
         data=json.dumps(data, ensure_ascii=False).encode('utf8', 'replace'))
-    if autoUpdate: self.update_friend(userName)
+    if autoUpdate:
+        self.update_friend(userName)
     return ReturnValue(rawResponse=r)
 
 def get_head_img(self, userName=None, chatroomUserName=None, picDir=None):
@@ -350,7 +385,8 @@ def get_head_img(self, userName=None, chatroomUserName=None, picDir=None):
     '''
     params = {
         'userName': userName or chatroomUserName or self.storageClass.userName,
-        'skey': self.loginInfo['skey'], }
+        'skey': self.loginInfo['skey'],
+        'type': 'big', }
     url = '%s/webwxgeticon' % self.loginInfo['url']
     if chatroomUserName is None:
         infoDict = self.storageClass.search_friends(userName=userName)

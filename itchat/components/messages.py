@@ -190,28 +190,37 @@ def produce_msg(core, msgList):
 
 def produce_group_chat(core, msg):
     r = re.match('(@[0-9a-z]*?):<br/>(.*)$', msg['Content'])
-    if not r:
-        utils.msg_formatter(msg, 'Content')
+    if r:
+        actualUserName, content = r.groups()
+        chatroomUserName = msg['FromUserName']
+    elif msg['FromUserName'] == core.storageClass.userName:
+        actualUserName = core.storageClass.userName
+        content = msg['Content']
+        chatroomUserName = msg['ToUserName']
+    else:
+        msg['ActualUserName'] = core.storageClass.userName
+        msg['ActualNickName'] = core.storageClass.nickName
+        msg['isAt'] = False
         return
-    actualUserName, content = r.groups()
-    chatroom = core.storageClass.search_chatrooms(userName=msg['FromUserName'])
+    chatroom = core.storageClass.search_chatrooms(userName=chatroomUserName)
     member = utils.search_dict_list((chatroom or {}).get(
         'MemberList') or [], 'UserName', actualUserName)
     if member is None:
         chatroom = core.update_chatroom(msg['FromUserName'])
         member = utils.search_dict_list((chatroom or {}).get(
             'MemberList') or [], 'UserName', actualUserName)
-    msg['ActualUserName'] = actualUserName
-    msg['ActualNickName'] = member['DisplayName'] or member['NickName']
-    msg['Content']        = content
-    utils.msg_formatter(msg, 'Content')
-    atFlag = '@' + (chatroom['self']['DisplayName']
-        or core.storageClass.nickName)
-    msg['isAt'] = (
-        (atFlag + (u'\u2005' if u'\u2005' in msg['Content'] else ' '))
-        in msg['Content']
-        or
-        msg['Content'].endswith(atFlag))
+    if member is None:
+        logger.debug('chatroom member fetch failed with %s' % actualUserName)
+    else:
+        msg['ActualUserName'] = actualUserName
+        msg['ActualNickName'] = member['DisplayName'] or member['NickName']
+        msg['Content']        = content
+        utils.msg_formatter(msg, 'Content')
+        atFlag = '@' + (chatroom['self']['DisplayName']
+            or core.storageClass.nickName)
+        msg['isAt'] = (
+            (atFlag + (u'\u2005' if u'\u2005' in msg['Content'] else ' '))
+            in msg['Content'] or msg['Content'].endswith(atFlag))
 
 def send_raw_msg(self, msgType, content, toUserName):
     url = '%s/webwxsendmsg' % self.loginInfo['url']
@@ -247,7 +256,7 @@ def upload_file(self, fileDir, isPicture=False, isVideo=False,
     fileSize = os.path.getsize(fileDir)
     fileSymbol = 'pic' if isPicture else 'video' if isVideo else'doc'
     with open(fileDir, 'rb') as f: fileMd5 = hashlib.md5(f.read()).hexdigest()
-    file = open(fileDir, 'rb')
+    file_ = open(fileDir, 'rb')
     chunks = int((fileSize - 1) / 524288) + 1
     clientMediaId = int(time.time() * 1e4)
     uploadMediaRequest = json.dumps(OrderedDict([
@@ -262,10 +271,13 @@ def upload_file(self, fileDir, isPicture=False, isVideo=False,
         ('ToUserName', toUserName),
         ('FileMd5', fileMd5)]
         ), separators = (',', ':'))
+    r = {'BaseResponse': {'Ret': -1005, 'ErrMsg': 'Empty file detected'}}
     for chunk in range(chunks):
         r = upload_chunk_file(self, fileDir, fileSymbol, fileSize,
-            file, chunk, chunks, uploadMediaRequest)
-    file.close()
+            file_, chunk, chunks, uploadMediaRequest)
+    file_.close()
+    if isinstance(r, dict):
+        return ReturnValue(r)
     return ReturnValue(rawResponse=r)
 
 def upload_chunk_file(core, fileDir, fileSymbol, fileSize,
